@@ -527,27 +527,14 @@ async def stream_openai_chat_completions(
     created = utc_now_timestamp()
     sent_role = False
     saw_tool_calls = False
-    showing_thinking = False
 
     for chunk in response:
         if chunk.type == "content_block_start":
             block = getattr(chunk, "content_block", None)
-            if getattr(block, "type", None) == "thinking":
+            if getattr(block, "type", None) in ("thinking", None):
                 continue
             if getattr(block, "type", None) != "tool_use":
                 continue
-            if showing_thinking:
-                yield sse_bytes(
-                    build_openai_stream_chunk(
-                        model,
-                        completion_id,
-                        created,
-                        text="\n</think>\n\n",
-                        include_role=not sent_role,
-                    )
-                )
-                sent_role = True
-                showing_thinking = False
             saw_tool_calls = True
             yield sse_bytes(
                 build_openai_stream_chunk(
@@ -570,51 +557,10 @@ async def stream_openai_chat_completions(
         if chunk.type != "content_block_delta":
             continue
         delta_type = getattr(chunk.delta, "type", None)
-        if delta_type == "thinking_delta" and getattr(chunk.delta, "thinking", None):
-            text = chunk.delta.thinking
-            if not showing_thinking:
-                text = f"<think>\n{text}"
-                showing_thinking = True
-            yield sse_bytes(
-                build_openai_stream_chunk(
-                    model,
-                    completion_id,
-                    created,
-                    text=text,
-                    include_role=not sent_role,
-                )
-            )
-            sent_role = True
-            continue
-
-        if delta_type == "signature_delta":
-            if showing_thinking:
-                yield sse_bytes(
-                    build_openai_stream_chunk(
-                        model,
-                        completion_id,
-                        created,
-                        text="\n</think>\n\n",
-                        include_role=not sent_role,
-                    )
-                )
-                sent_role = True
-                showing_thinking = False
+        if delta_type in ("thinking_delta", "signature_delta"):
             continue
 
         if delta_type == "text_delta" and getattr(chunk.delta, "text", None):
-            if showing_thinking:
-                yield sse_bytes(
-                    build_openai_stream_chunk(
-                        model,
-                        completion_id,
-                        created,
-                        text="\n</think>\n\n",
-                        include_role=not sent_role,
-                    )
-                )
-                sent_role = True
-                showing_thinking = False
             yield sse_bytes(
                 build_openai_stream_chunk(
                     model,
@@ -680,7 +626,7 @@ async def non_streaming_openai_chat_completions(
     completion_id = build_chat_completion_id()
     created = utc_now_timestamp()
     thinking_blocks = extract_response_thinking_blocks(response)
-    text = format_assistant_content(response_text(response), thinking_blocks)
+    text = response_text(response) or None
     tool_calls = build_openai_tool_calls(response)
     finish_reason = map_anthropic_finish_reason(
         getattr(response, "stop_reason", None),

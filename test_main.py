@@ -241,7 +241,7 @@ class ProxyCompatibilityTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(
             payload["choices"][0]["message"]["content"],
-            "<think>\nI should break this into steps.\n</think>\n\nHello world",
+            "Hello world",
         )
         self.assertEqual(
             payload["choices"][0]["message"]["thinking_blocks"],
@@ -448,9 +448,8 @@ class ProxyCompatibilityTests(unittest.TestCase):
             lines = [line for line in response.iter_lines() if line]
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(any("<think>" in line for line in lines))
-        self.assertTrue(any("I should break this into steps." in line for line in lines))
-        self.assertTrue(any("</think>" in line for line in lines))
+        self.assertFalse(any("<think>" in line for line in lines))
+        self.assertFalse(any("</think>" in line for line in lines))
         self.assertTrue(any("Hello world" in line for line in lines))
         self.assertEqual(lines[-1], "data: [DONE]")
 
