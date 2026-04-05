@@ -159,7 +159,9 @@ The application loads `.env` from the repository root.
 - OpenAI vision input is supported for `image_url` values that use base64 data URLs.
 - `/api/embeddings` currently returns 1024-dimensional zero vectors for compatibility rather than real embeddings.
 - Clients can send a top-level `thinking` object on `/api/chat`, `/api/generate`, or `/v1/chat/completions`; if omitted, the proxy falls back to the optional `ANTHROPIC_THINKING_*` environment defaults.
-- When Anthropic returns visible thinking, the proxy prepends it to assistant text as `<think>...</think>` and also includes raw `thinking_blocks` on assistant messages in OpenAI-compatible responses for clients that round-trip custom fields.
+- Ollama streaming (`/api/chat`, `/api/generate`) can emit visible thinking as `<think>...</think>` fragments when thinking is enabled.
+- OpenAI streaming (`/v1/chat/completions` with `stream=true`) does not emit thinking deltas in SSE chunks.
+- OpenAI non-streaming includes raw `thinking_blocks` on assistant messages for clients that round-trip custom fields.
 
 ## Usage Examples
 
@@ -229,4 +231,4 @@ docker compose up --build
 
 ## License
 
-No license file is currently included in this repository.
+This repository includes a [LICENSE](LICENSE) file.

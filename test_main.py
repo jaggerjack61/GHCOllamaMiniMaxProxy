@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import unittest
 
@@ -99,6 +100,21 @@ class FakeMessagesAPI:
         if kwargs.get("stream"):
             return self.stream_response
         return self.response
+
+
+class RaisingMessagesAPI:
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        raise self.exc
+
+
+class RaisingAnthropicClient:
+    def __init__(self, exc: Exception):
+        self.messages = RaisingMessagesAPI(exc)
 
 
 class FakeAnthropicClient:
@@ -452,6 +468,58 @@ class ProxyCompatibilityTests(unittest.TestCase):
         self.assertFalse(any("</think>" in line for line in lines))
         self.assertTrue(any("Hello world" in line for line in lines))
         self.assertEqual(lines[-1], "data: [DONE]")
+
+    def test_chat_stream_closes_thinking_before_done(self):
+        main.client.messages.stream_response = [
+            FakeStreamChunk(FakeThinkingDelta("internal thought"), index=0),
+        ]
+
+        with self.client.stream(
+            "POST",
+            "/api/chat",
+            json={
+                "model": main.MODEL_NAME,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "thinking": {"type": "enabled", "budget_tokens": 32},
+            },
+        ) as response:
+            payloads = [json.loads(line) for line in response.iter_lines() if line]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any(item["message"]["content"].startswith("<think>") for item in payloads))
+        self.assertTrue(any(item["message"]["content"] == "\n</think>\n\n" for item in payloads))
+        self.assertTrue(payloads[-1]["done"])
+
+    def test_embeddings_rejects_oversized_batch(self):
+        response = self.client.post(
+            "/api/embeddings",
+            json={
+                "model": main.MODEL_NAME,
+                "input": ["a"] * 1000,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.json()
+        self.assertEqual(payload["error"]["type"], "validation_error")
+
+    def test_upstream_error_is_normalized(self):
+        main.client = RaisingAnthropicClient(RuntimeError("upstream exploded"))
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": main.MODEL_NAME,
+                "stream": False,
+                "messages": [{"role": "user", "content": "Say hello."}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 502)
+        payload = response.json()
+        self.assertEqual(payload["error"]["type"], "upstream_error")
+        self.assertEqual(payload["error"]["code"], "RuntimeError")
 
 
 if __name__ == "__main__":
