@@ -29,8 +29,11 @@ from openai_compat import (
     convert_openai_messages_to_anthropic,
     convert_openai_tool_choice,
     convert_openai_tools_to_anthropic,
+    extract_response_thinking_blocks,
+    format_assistant_content,
     get_non_system_openai_messages,
     map_anthropic_finish_reason,
+    normalize_thinking_block,
     normalize_role,
     response_text,
 )
@@ -61,6 +64,26 @@ DEFAULT_SYSTEM_PROMPT = os.getenv(
 )
 
 
+def build_default_thinking_config() -> dict | None:
+    thinking_type = os.getenv("ANTHROPIC_THINKING_TYPE", "").strip()
+    if not thinking_type:
+        return None
+
+    config: dict[str, str | int] = {"type": thinking_type}
+    budget_tokens = os.getenv("ANTHROPIC_THINKING_BUDGET_TOKENS", "").strip()
+    if budget_tokens:
+        config["budget_tokens"] = int(budget_tokens)
+
+    display = os.getenv("ANTHROPIC_THINKING_DISPLAY", "").strip()
+    if display:
+        config["display"] = display
+
+    return config
+
+
+DEFAULT_THINKING_CONFIG = build_default_thinking_config()
+
+
 def parse_capabilities(raw: str) -> list[str]:
     capabilities = [item.strip() for item in raw.split(",") if item.strip()]
     return capabilities or ["completion"]
@@ -69,6 +92,10 @@ def parse_capabilities(raw: str) -> list[str]:
 MODEL_CAPABILITIES = parse_capabilities(
     os.getenv("OLLAMA_MODEL_CAPABILITIES", "completion,tools,vision")
 )
+
+
+def resolve_thinking_config(thinking: dict | None) -> dict | None:
+    return thinking if thinking is not None else DEFAULT_THINKING_CONFIG
 
 
 def utc_now_iso() -> str:
@@ -84,7 +111,16 @@ def convert_ollama_messages_to_anthropic(
 ) -> list[dict]:
     messages = []
     for msg in ollama_messages:
-        content: list[dict] = [{"type": "text", "text": msg.content}]
+        content: list[dict] = []
+        if msg.role == "assistant":
+            for block in msg.thinking_blocks or []:
+                normalized_block = normalize_thinking_block(block)
+                if normalized_block is not None:
+                    content.append(normalized_block)
+
+        if msg.content or not content:
+            content.append({"type": "text", "text": msg.content})
+
         if msg.images:
             for img in msg.images:
                 content.append(build_image_block(img))
@@ -109,6 +145,7 @@ def create_message_response(
     stream: bool = False,
     tools: list[dict] | None = None,
     tool_choice: dict | None = None,
+    thinking: dict | None = None,
 ):
     payload = {
         "model": UPSTREAM_MODEL_NAME,
@@ -120,9 +157,18 @@ def create_message_response(
         payload["tools"] = tools
     if tool_choice:
         payload["tool_choice"] = tool_choice
+    if thinking:
+        payload["thinking"] = thinking
     if stream:
         payload["stream"] = True
     return client.messages.create(**payload)
+
+
+def build_ollama_message(text: str | None, thinking_blocks: list[dict[str, str]]) -> dict:
+    message = {"role": "assistant", "content": text or ""}
+    if thinking_blocks:
+        message["thinking_blocks"] = thinking_blocks
+    return message
 
 
 def build_ollama_listing(model_name: str) -> dict:
@@ -216,32 +262,79 @@ async def chat(req: OllamaChatRequest):
     messages = convert_ollama_messages_to_anthropic(
         get_non_system_messages(req.messages)
     )
+    thinking = resolve_thinking_config(req.thinking)
 
     if req.stream:
         return StreamingResponse(
-            stream_chat_response(system, messages, req.model),
+            stream_chat_response(system, messages, req.model, thinking),
             media_type="application/x-ndjson",
         )
     else:
-        return await non_streaming_chat(system, messages, req.model)
+        return await non_streaming_chat(system, messages, req.model, thinking)
 
 
-async def stream_chat_response(system: str, messages: list[dict], model: str):
-    response = create_message_response(system, messages, stream=True)
+async def stream_chat_response(
+    system: str,
+    messages: list[dict],
+    model: str,
+    thinking: dict | None,
+):
+    response = create_message_response(system, messages, stream=True, thinking=thinking)
 
-    full_text = ""
+    showing_thinking = False
     for chunk in response:
-        if chunk.type == "content_block_delta":
-            if hasattr(chunk.delta, "text") and chunk.delta.text:
-                full_text += chunk.delta.text
+        if chunk.type != "content_block_delta":
+            continue
+
+        delta_type = getattr(chunk.delta, "type", None)
+        if delta_type == "thinking_delta" and getattr(chunk.delta, "thinking", None):
+            text = chunk.delta.thinking
+            if not showing_thinking:
+                text = f"<think>\n{text}"
+                showing_thinking = True
+            yield JSONResponse(
+                content=OllamaChatResponse(
+                    model=model,
+                    created_at=utc_now_iso(),
+                    message={"role": "assistant", "content": text},
+                    done=False,
+                ).model_dump()
+            ).body + b"\n"
+            continue
+
+        if delta_type == "signature_delta":
+            if showing_thinking:
                 yield JSONResponse(
                     content=OllamaChatResponse(
                         model=model,
                         created_at=utc_now_iso(),
-                        message={"role": "assistant", "content": chunk.delta.text},
+                        message={"role": "assistant", "content": "\n</think>\n\n"},
                         done=False,
                     ).model_dump()
                 ).body + b"\n"
+                showing_thinking = False
+            continue
+
+        if delta_type == "text_delta" and getattr(chunk.delta, "text", None):
+            if showing_thinking:
+                yield JSONResponse(
+                    content=OllamaChatResponse(
+                        model=model,
+                        created_at=utc_now_iso(),
+                        message={"role": "assistant", "content": "\n</think>\n\n"},
+                        done=False,
+                    ).model_dump()
+                ).body + b"\n"
+                showing_thinking = False
+
+            yield JSONResponse(
+                content=OllamaChatResponse(
+                    model=model,
+                    created_at=utc_now_iso(),
+                    message={"role": "assistant", "content": chunk.delta.text},
+                    done=False,
+                ).model_dump()
+            ).body + b"\n"
 
     yield JSONResponse(
         content=OllamaChatResponse(
@@ -253,14 +346,20 @@ async def stream_chat_response(system: str, messages: list[dict], model: str):
     ).body + b"\n"
 
 
-async def non_streaming_chat(system: str, messages: list[dict], model: str):
-    response = create_message_response(system, messages)
-    text = response_text(response)
+async def non_streaming_chat(
+    system: str,
+    messages: list[dict],
+    model: str,
+    thinking: dict | None,
+):
+    response = create_message_response(system, messages, thinking=thinking)
+    thinking_blocks = extract_response_thinking_blocks(response)
+    text = format_assistant_content(response_text(response), thinking_blocks)
 
     return OllamaChatResponse(
         model=model,
         created_at=utc_now_iso(),
-        message={"role": "assistant", "content": text},
+        message=build_ollama_message(text, thinking_blocks),
         done=True,
     )
 
@@ -268,31 +367,80 @@ async def non_streaming_chat(system: str, messages: list[dict], model: str):
 @app.post("/api/generate")
 async def generate(req: OllamaGenerateRequest):
     messages = [OllamaMessage(role="user", content=req.prompt)]
+    thinking = resolve_thinking_config(req.thinking)
 
     if req.stream:
         return StreamingResponse(
-            stream_generate_response(messages, req.model),
+            stream_generate_response(messages, req.model, thinking),
             media_type="application/x-ndjson",
         )
     else:
-        return await non_streaming_generate(messages, req.model)
+        return await non_streaming_generate(messages, req.model, thinking)
 
 
-async def stream_generate_response(messages: list[OllamaMessage], model: str):
+async def stream_generate_response(
+    messages: list[OllamaMessage],
+    model: str,
+    thinking: dict | None,
+):
     anthropic_messages = convert_ollama_messages_to_anthropic(messages)
-    response = create_message_response("", anthropic_messages, stream=True)
+    response = create_message_response("", anthropic_messages, stream=True, thinking=thinking)
+
+    showing_thinking = False
 
     for chunk in response:
-        if chunk.type == "content_block_delta":
-            if hasattr(chunk.delta, "text") and chunk.delta.text:
+        if chunk.type != "content_block_delta":
+            continue
+
+        delta_type = getattr(chunk.delta, "type", None)
+        if delta_type == "thinking_delta" and getattr(chunk.delta, "thinking", None):
+            text = chunk.delta.thinking
+            if not showing_thinking:
+                text = f"<think>\n{text}"
+                showing_thinking = True
+            yield JSONResponse(
+                content=OllamaGenerateResponse(
+                    model=model,
+                    created_at=utc_now_iso(),
+                    response=text,
+                    done=False,
+                ).model_dump()
+            ).body + b"\n"
+            continue
+
+        if delta_type == "signature_delta":
+            if showing_thinking:
                 yield JSONResponse(
                     content=OllamaGenerateResponse(
                         model=model,
                         created_at=utc_now_iso(),
-                        response=chunk.delta.text,
+                        response="\n</think>\n\n",
                         done=False,
                     ).model_dump()
                 ).body + b"\n"
+                showing_thinking = False
+            continue
+
+        if delta_type == "text_delta" and getattr(chunk.delta, "text", None):
+            if showing_thinking:
+                yield JSONResponse(
+                    content=OllamaGenerateResponse(
+                        model=model,
+                        created_at=utc_now_iso(),
+                        response="\n</think>\n\n",
+                        done=False,
+                    ).model_dump()
+                ).body + b"\n"
+                showing_thinking = False
+
+            yield JSONResponse(
+                content=OllamaGenerateResponse(
+                    model=model,
+                    created_at=utc_now_iso(),
+                    response=chunk.delta.text,
+                    done=False,
+                ).model_dump()
+            ).body + b"\n"
 
     yield JSONResponse(
         content=OllamaGenerateResponse(
@@ -304,15 +452,20 @@ async def stream_generate_response(messages: list[OllamaMessage], model: str):
     ).body + b"\n"
 
 
-async def non_streaming_generate(messages: list[OllamaMessage], model: str):
+async def non_streaming_generate(
+    messages: list[OllamaMessage],
+    model: str,
+    thinking: dict | None,
+):
     anthropic_messages = convert_ollama_messages_to_anthropic(messages)
-    response = create_message_response("", anthropic_messages)
-    text = response_text(response)
+    response = create_message_response("", anthropic_messages, thinking=thinking)
+    thinking_blocks = extract_response_thinking_blocks(response)
+    text = format_assistant_content(response_text(response), thinking_blocks)
 
     return OllamaGenerateResponse(
         model=model,
         created_at=utc_now_iso(),
-        response=text,
+        response=text or "",
         done=True,
     )
 
@@ -325,6 +478,7 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest):
     )
     tools = convert_openai_tools_to_anthropic(req.tools, req.tool_choice)
     tool_choice = convert_openai_tool_choice(req.tool_choice)
+    thinking = resolve_thinking_config(req.thinking)
 
     if req.stream:
         return StreamingResponse(
@@ -335,6 +489,7 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest):
                 req.max_tokens,
                 tools,
                 tool_choice,
+                thinking,
             ),
             media_type="text/event-stream",
         )
@@ -346,6 +501,7 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest):
         req.max_tokens,
         tools,
         tool_choice,
+        thinking,
     )
 
 
@@ -356,6 +512,7 @@ async def stream_openai_chat_completions(
     max_tokens: int | None,
     tools: list[dict] | None,
     tool_choice: dict | None,
+    thinking: dict | None,
 ):
     response = create_message_response(
         system,
@@ -364,17 +521,33 @@ async def stream_openai_chat_completions(
         stream=True,
         tools=tools,
         tool_choice=tool_choice,
+        thinking=thinking,
     )
     completion_id = build_chat_completion_id()
     created = utc_now_timestamp()
     sent_role = False
     saw_tool_calls = False
+    showing_thinking = False
 
     for chunk in response:
         if chunk.type == "content_block_start":
             block = getattr(chunk, "content_block", None)
+            if getattr(block, "type", None) == "thinking":
+                continue
             if getattr(block, "type", None) != "tool_use":
                 continue
+            if showing_thinking:
+                yield sse_bytes(
+                    build_openai_stream_chunk(
+                        model,
+                        completion_id,
+                        created,
+                        text="\n</think>\n\n",
+                        include_role=not sent_role,
+                    )
+                )
+                sent_role = True
+                showing_thinking = False
             saw_tool_calls = True
             yield sse_bytes(
                 build_openai_stream_chunk(
@@ -397,7 +570,51 @@ async def stream_openai_chat_completions(
         if chunk.type != "content_block_delta":
             continue
         delta_type = getattr(chunk.delta, "type", None)
+        if delta_type == "thinking_delta" and getattr(chunk.delta, "thinking", None):
+            text = chunk.delta.thinking
+            if not showing_thinking:
+                text = f"<think>\n{text}"
+                showing_thinking = True
+            yield sse_bytes(
+                build_openai_stream_chunk(
+                    model,
+                    completion_id,
+                    created,
+                    text=text,
+                    include_role=not sent_role,
+                )
+            )
+            sent_role = True
+            continue
+
+        if delta_type == "signature_delta":
+            if showing_thinking:
+                yield sse_bytes(
+                    build_openai_stream_chunk(
+                        model,
+                        completion_id,
+                        created,
+                        text="\n</think>\n\n",
+                        include_role=not sent_role,
+                    )
+                )
+                sent_role = True
+                showing_thinking = False
+            continue
+
         if delta_type == "text_delta" and getattr(chunk.delta, "text", None):
+            if showing_thinking:
+                yield sse_bytes(
+                    build_openai_stream_chunk(
+                        model,
+                        completion_id,
+                        created,
+                        text="\n</think>\n\n",
+                        include_role=not sent_role,
+                    )
+                )
+                sent_role = True
+                showing_thinking = False
             yield sse_bytes(
                 build_openai_stream_chunk(
                     model,
@@ -450,6 +667,7 @@ async def non_streaming_openai_chat_completions(
     max_tokens: int | None,
     tools: list[dict] | None,
     tool_choice: dict | None,
+    thinking: dict | None,
 ):
     response = create_message_response(
         system,
@@ -457,10 +675,12 @@ async def non_streaming_openai_chat_completions(
         max_tokens=max_tokens or 4096,
         tools=tools,
         tool_choice=tool_choice,
+        thinking=thinking,
     )
     completion_id = build_chat_completion_id()
     created = utc_now_timestamp()
-    text = response_text(response)
+    thinking_blocks = extract_response_thinking_blocks(response)
+    text = format_assistant_content(response_text(response), thinking_blocks)
     tool_calls = build_openai_tool_calls(response)
     finish_reason = map_anthropic_finish_reason(
         getattr(response, "stop_reason", None),
@@ -472,5 +692,6 @@ async def non_streaming_openai_chat_completions(
         created,
         text=text,
         tool_calls=tool_calls,
+        thinking_blocks=thinking_blocks,
         finish_reason=finish_reason,
     )

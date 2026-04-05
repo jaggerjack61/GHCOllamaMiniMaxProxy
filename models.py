@@ -7,6 +7,7 @@ class OllamaMessage(BaseModel):
     role: str
     content: str
     images: Optional[list[str]] = None
+    thinking_blocks: Optional[list[dict[str, Any]]] = None
 
 
 class OllamaChatRequest(BaseModel):
@@ -14,6 +15,7 @@ class OllamaChatRequest(BaseModel):
     messages: list[OllamaMessage]
     stream: bool = True
     options: Optional[dict] = None
+    thinking: Optional[dict[str, Any]] = None
 
 
 class OllamaGenerateRequest(BaseModel):
@@ -21,6 +23,7 @@ class OllamaGenerateRequest(BaseModel):
     prompt: str
     stream: bool = True
     options: Optional[dict] = None
+    thinking: Optional[dict[str, Any]] = None
 
 
 class OllamaChatResponse(BaseModel):
@@ -97,6 +100,7 @@ class OpenAIChatMessage(BaseModel):
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
     tool_calls: Optional[list[OpenAIToolCall]] = None
+    thinking_blocks: Optional[list[dict[str, Any]]] = None
 
 
 class OpenAIChatCompletionRequest(BaseModel):
@@ -108,3 +112,4 @@ class OpenAIChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     tools: Optional[list[OpenAITool]] = None
     tool_choice: Optional[str | dict[str, Any]] = None
+    thinking: Optional[dict[str, Any]] = None

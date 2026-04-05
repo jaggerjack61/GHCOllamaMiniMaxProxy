@@ -10,6 +10,7 @@ Github Copilot Ollama-MiniMax Proxy is a FastAPI service built primarily to let 
 - Streaming responses for both Ollama NDJSON and OpenAI SSE clients
 - Tool and function calling translation between OpenAI tool calls and Anthropic tool use blocks
 - Vision input support for Ollama `images` and OpenAI `image_url` data URLs
+- Anthropic thinking passthrough with visible `<think>...</think>` output when enabled
 
 ## Primary Use Case
 
@@ -121,6 +122,9 @@ The application loads `.env` from the repository root.
 | `ANTHROPIC_BASE_URL` | No | `https://api.minimax.io/anthropic` | Anthropic-compatible MiniMax base URL |
 | `ANTHROPIC_MODEL` | No | `MiniMax-M2.7` | Upstream model name sent to MiniMax |
 | `API_TIMEOUT_MS` | No | `3000000` | Upstream request timeout in milliseconds |
+| `ANTHROPIC_THINKING_TYPE` | No | None | Default Anthropic thinking mode used when the client does not send a `thinking` object |
+| `ANTHROPIC_THINKING_BUDGET_TOKENS` | No | None | Default thinking budget passed upstream when `ANTHROPIC_THINKING_TYPE` is set |
+| `ANTHROPIC_THINKING_DISPLAY` | No | None | Optional Anthropic thinking display mode such as `summarized` or `omitted` |
 | `DEFAULT_SYSTEM_PROMPT` | No | `You are a helpful assistant.` | Fallback system prompt when none is provided by the client |
 | `OLLAMA_MODEL_NAME` | No | Inherits `ANTHROPIC_MODEL` | Model name exposed to Ollama and OpenAI clients |
 | `OLLAMA_MODEL_ARCHITECTURE` | No | `minimax` | Architecture reported by `/api/show` |
@@ -154,6 +158,8 @@ The application loads `.env` from the repository root.
 - GitHub Copilot's Ollama provider discovers models via `/api/show` and `/api/tags`, then sends chat traffic to `/v1/chat/completions`.
 - OpenAI vision input is supported for `image_url` values that use base64 data URLs.
 - `/api/embeddings` currently returns 1024-dimensional zero vectors for compatibility rather than real embeddings.
+- Clients can send a top-level `thinking` object on `/api/chat`, `/api/generate`, or `/v1/chat/completions`; if omitted, the proxy falls back to the optional `ANTHROPIC_THINKING_*` environment defaults.
+- When Anthropic returns visible thinking, the proxy prepends it to assistant text as `<think>...</think>` and also includes raw `thinking_blocks` on assistant messages in OpenAI-compatible responses for clients that round-trip custom fields.
 
 ## Usage Examples
 

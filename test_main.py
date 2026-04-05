@@ -27,6 +27,14 @@ class FakeToolUseBlock:
         self.input = tool_input
 
 
+class FakeThinkingBlock:
+    type = "thinking"
+
+    def __init__(self, thinking: str, signature: str = "sig_123"):
+        self.thinking = thinking
+        self.signature = signature
+
+
 class FakeTextDelta:
     type = "text_delta"
 
@@ -39,6 +47,20 @@ class FakeInputJsonDelta:
 
     def __init__(self, partial_json: str):
         self.partial_json = partial_json
+
+
+class FakeThinkingDelta:
+    type = "thinking_delta"
+
+    def __init__(self, thinking: str):
+        self.thinking = thinking
+
+
+class FakeSignatureDelta:
+    type = "signature_delta"
+
+    def __init__(self, signature: str):
+        self.signature = signature
 
 
 class FakeStreamChunk:
@@ -194,6 +216,48 @@ class ProxyCompatibilityTests(unittest.TestCase):
             ],
         )
 
+    def test_chat_completions_passes_thinking_and_exposes_it_in_content(self):
+        main.client.messages.response = FakeMessageResponse(
+            [
+                FakeThinkingBlock("I should break this into steps."),
+                FakeTextBlock("Hello world"),
+            ]
+        )
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": main.MODEL_NAME,
+                "stream": False,
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 1024,
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            payload["choices"][0]["message"]["content"],
+            "<think>\nI should break this into steps.\n</think>\n\nHello world",
+        )
+        self.assertEqual(
+            payload["choices"][0]["message"]["thinking_blocks"],
+            [
+                {
+                    "type": "thinking",
+                    "thinking": "I should break this into steps.",
+                    "signature": "sig_123",
+                }
+            ],
+        )
+        self.assertEqual(
+            main.client.messages.calls[0]["thinking"],
+            {"type": "enabled", "budget_tokens": 1024},
+        )
+
     def test_chat_completions_translates_tool_history_to_anthropic(self):
         response = self.client.post(
             "/v1/chat/completions",
@@ -257,6 +321,45 @@ class ProxyCompatibilityTests(unittest.TestCase):
             ],
         )
 
+    def test_chat_completions_preserves_assistant_thinking_blocks(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": main.MODEL_NAME,
+                "stream": False,
+                "messages": [
+                    {"role": "user", "content": "Read main.py"},
+                    {
+                        "role": "assistant",
+                        "content": "I found the file.",
+                        "thinking_blocks": [
+                            {
+                                "type": "thinking",
+                                "thinking": "I should inspect the repository first.",
+                                "signature": "sig_prev",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            main.client.messages.calls[0]["messages"][1],
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "I should inspect the repository first.",
+                        "signature": "sig_prev",
+                    },
+                    {"type": "text", "text": "I found the file."},
+                ],
+            },
+        )
+
     def test_chat_completions_streams_sse_chunks(self):
         with self.client.stream(
             "POST",
@@ -316,6 +419,39 @@ class ProxyCompatibilityTests(unittest.TestCase):
         self.assertTrue(any('"name":"read_file"' in line for line in lines))
         self.assertTrue(any('"arguments":"{\\"filePath\\":\\"main.py\\"}"' in line for line in lines))
         self.assertTrue(any('"finish_reason":"tool_calls"' in line for line in lines))
+        self.assertEqual(lines[-1], "data: [DONE]")
+
+    def test_chat_completions_streams_thinking_chunks(self):
+        main.client.messages.stream_response = [
+            FakeContentBlockStartChunk(FakeThinkingBlock(""), index=0),
+            FakeStreamChunk(
+                FakeThinkingDelta("I should break this into steps."),
+                index=0,
+            ),
+            FakeStreamChunk(FakeSignatureDelta("sig_stream"), index=0),
+            FakeStreamChunk(FakeTextDelta("Hello world"), index=1),
+        ]
+
+        with self.client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": main.MODEL_NAME,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 1024,
+                },
+            },
+        ) as response:
+            lines = [line for line in response.iter_lines() if line]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any("<think>" in line for line in lines))
+        self.assertTrue(any("I should break this into steps." in line for line in lines))
+        self.assertTrue(any("</think>" in line for line in lines))
+        self.assertTrue(any("Hello world" in line for line in lines))
         self.assertEqual(lines[-1], "data: [DONE]")
 
 

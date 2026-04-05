@@ -110,6 +110,56 @@ def convert_assistant_tool_calls(tool_calls: list[OpenAIToolCall] | None) -> lis
     ]
 
 
+def normalize_thinking_block(block: dict[str, Any] | None) -> dict[str, str] | None:
+    if not isinstance(block, dict) or block.get("type") != "thinking":
+        return None
+    return {
+        "type": "thinking",
+        "thinking": block.get("thinking") or "",
+        "signature": block.get("signature") or "",
+    }
+
+
+def get_assistant_thinking_blocks(message: OpenAIChatMessage) -> list[dict[str, str]]:
+    normalized_blocks = []
+    for block in message.thinking_blocks or []:
+        normalized_block = normalize_thinking_block(block)
+        if normalized_block is not None:
+            normalized_blocks.append(normalized_block)
+    return normalized_blocks
+
+
+def extract_response_thinking_blocks(response) -> list[dict[str, str]]:
+    blocks = []
+    for block in response.content:
+        if getattr(block, "type", None) != "thinking":
+            continue
+        blocks.append(
+            {
+                "type": "thinking",
+                "thinking": getattr(block, "thinking", "") or "",
+                "signature": getattr(block, "signature", "") or "",
+            }
+        )
+    return blocks
+
+
+def format_assistant_content(
+    text: str | None,
+    thinking_blocks: list[dict[str, str]] | None,
+) -> str | None:
+    visible_thinking = "\n\n".join(
+        block["thinking"].strip()
+        for block in thinking_blocks or []
+        if block.get("thinking", "").strip()
+    )
+    if not visible_thinking:
+        return text
+    if text:
+        return f"<think>\n{visible_thinking}\n</think>\n\n{text}"
+    return f"<think>\n{visible_thinking}\n</think>"
+
+
 def convert_openai_message_to_anthropic(message: OpenAIChatMessage) -> tuple[str, list[dict]]:
     if message.role == "tool":
         return "user", [
@@ -121,7 +171,7 @@ def convert_openai_message_to_anthropic(message: OpenAIChatMessage) -> tuple[str
         ]
 
     if message.role == "assistant":
-        content: list[dict] = []
+        content: list[dict] = get_assistant_thinking_blocks(message)
         text = extract_openai_text(message.content)
         if text:
             content.append({"type": "text", "text": text})
@@ -229,11 +279,14 @@ def build_openai_chat_completion(
     *,
     text: str | None,
     tool_calls: list[dict] | None,
+    thinking_blocks: list[dict[str, str]] | None,
     finish_reason: str,
 ) -> dict:
     message = {"role": "assistant", "content": text if text else None}
     if tool_calls:
         message["tool_calls"] = tool_calls
+    if thinking_blocks:
+        message["thinking_blocks"] = thinking_blocks
 
     return {
         "id": completion_id,
