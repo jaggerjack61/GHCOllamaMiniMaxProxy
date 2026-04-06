@@ -53,20 +53,28 @@ client = anthropic.Anthropic(
 OLLAMA_VERSION = "0.6.4"
 UPSTREAM_MODEL_NAME = os.getenv("ANTHROPIC_MODEL", "MiniMax-M2.7")
 MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", UPSTREAM_MODEL_NAME)
+HIGH_MODEL_NAME = os.getenv("OLLAMA_HIGH_MODEL_NAME", f"{MODEL_NAME} High")
 MODEL_ARCHITECTURE = os.getenv("OLLAMA_MODEL_ARCHITECTURE", "minimax")
 MODEL_BASENAME = os.getenv("OLLAMA_MODEL_BASENAME", MODEL_NAME)
+HIGH_MODEL_BASENAME = os.getenv("OLLAMA_HIGH_MODEL_BASENAME", HIGH_MODEL_NAME)
 MODEL_CONTEXT_LENGTH = int(os.getenv("OLLAMA_MODEL_CONTEXT_LENGTH", "204800"))
 MODEL_SIZE = int(os.getenv("OLLAMA_MODEL_SIZE", "4000000000"))
 MODEL_FAMILY = os.getenv("OLLAMA_MODEL_FAMILY", MODEL_ARCHITECTURE)
 MODEL_FORMAT = os.getenv("OLLAMA_MODEL_FORMAT", "proxy")
 MODEL_PARAMETER_SIZE = os.getenv("OLLAMA_MODEL_PARAMETER_SIZE", "unknown")
 MODIFIED_AT = os.getenv("OLLAMA_MODIFIED_AT", "2026-01-01T00:00:00Z")
+MODEL_THINKING_TYPE = os.getenv("OLLAMA_DEFAULT_THINKING_TYPE", "enabled").strip() or "enabled"
+MODEL_THINKING_DISPLAY = os.getenv("ANTHROPIC_THINKING_DISPLAY", "").strip()
+MODEL_THINKING_BUDGET = int(os.getenv("OLLAMA_MODEL_THINKING_BUDGET_TOKENS", "8192"))
+HIGH_MODEL_THINKING_BUDGET = int(
+    os.getenv("OLLAMA_HIGH_MODEL_THINKING_BUDGET_TOKENS", "24576")
+)
 DEFAULT_SYSTEM_PROMPT = os.getenv(
     "DEFAULT_SYSTEM_PROMPT", "You are a helpful assistant."
 )
 
 
-def build_default_thinking_config() -> dict | None:
+def build_env_default_thinking_config() -> dict | None:
     thinking_type = os.getenv("ANTHROPIC_THINKING_TYPE", "").strip()
     if not thinking_type:
         return None
@@ -83,7 +91,37 @@ def build_default_thinking_config() -> dict | None:
     return config
 
 
-DEFAULT_THINKING_CONFIG = build_default_thinking_config()
+def build_model_default_thinking_config(budget_tokens: int) -> dict:
+    config: dict[str, str | int] = {
+        "type": MODEL_THINKING_TYPE,
+        "budget_tokens": budget_tokens,
+    }
+    if MODEL_THINKING_DISPLAY:
+        config["display"] = MODEL_THINKING_DISPLAY
+    return config
+
+
+def build_proxy_models() -> list[dict[str, object]]:
+    models = [
+        {
+            "name": MODEL_NAME,
+            "basename": MODEL_BASENAME,
+            "remote_model": UPSTREAM_MODEL_NAME,
+            "thinking": build_model_default_thinking_config(MODEL_THINKING_BUDGET),
+        },
+        {
+            "name": HIGH_MODEL_NAME,
+            "basename": HIGH_MODEL_BASENAME,
+            "remote_model": UPSTREAM_MODEL_NAME,
+            "thinking": build_model_default_thinking_config(HIGH_MODEL_THINKING_BUDGET),
+        },
+    ]
+    return list({model["name"]: model for model in models}.values())
+
+
+ENV_DEFAULT_THINKING_CONFIG = build_env_default_thinking_config()
+PROXY_MODELS = build_proxy_models()
+PROXY_MODEL_INDEX = {model["name"]: model for model in PROXY_MODELS}
 
 
 def parse_capabilities(raw: str) -> list[str]:
@@ -97,8 +135,28 @@ MODEL_CAPABILITIES = parse_capabilities(
 MAX_EMBEDDINGS_BATCH = int(os.getenv("MAX_EMBEDDINGS_BATCH", "256"))
 
 
-def resolve_thinking_config(thinking: dict | None) -> dict | None:
-    return thinking if thinking is not None else DEFAULT_THINKING_CONFIG
+def resolve_model(model_name: str) -> dict[str, object]:
+    model = PROXY_MODEL_INDEX.get(model_name)
+    if model is not None:
+        return model
+
+    default_model = PROXY_MODEL_INDEX[MODEL_NAME]
+    return {
+        **default_model,
+        "name": model_name,
+        "thinking": dict(default_model["thinking"]),
+    }
+
+
+def resolve_thinking_config(model_name: str, thinking: dict | None) -> dict | None:
+    if thinking is not None:
+        return thinking
+
+    model = PROXY_MODEL_INDEX.get(model_name)
+    if model is not None:
+        return dict(model["thinking"])
+
+    return ENV_DEFAULT_THINKING_CONFIG
 
 
 def utc_now_iso() -> str:
@@ -141,6 +199,7 @@ def get_non_system_messages(ollama_messages: list[OllamaMessage]) -> list[Ollama
 
 
 def create_message_response(
+    model_name: str,
     system: str,
     messages: list[dict],
     *,
@@ -150,8 +209,9 @@ def create_message_response(
     tool_choice: dict | None = None,
     thinking: dict | None = None,
 ):
+    model = resolve_model(model_name)
     payload = {
-        "model": UPSTREAM_MODEL_NAME,
+        "model": model["remote_model"],
         "max_tokens": max_tokens,
         "system": system or DEFAULT_SYSTEM_PROMPT,
         "messages": messages,
@@ -183,18 +243,19 @@ def build_ollama_listing(model_name: str) -> dict:
     }
 
 
-def build_model_info() -> dict:
+def build_model_info(model_basename: str) -> dict:
     return {
         "general.architecture": MODEL_ARCHITECTURE,
-        "general.basename": MODEL_BASENAME,
+        "general.basename": model_basename,
         f"{MODEL_ARCHITECTURE}.context_length": MODEL_CONTEXT_LENGTH,
     }
 
 
 def build_ollama_show_response(model_name: str) -> dict:
+    model = resolve_model(model_name)
     return {
         **build_ollama_listing(model_name),
-        "remote_model": UPSTREAM_MODEL_NAME,
+        "remote_model": model["remote_model"],
         "parameters": f"num_ctx {MODEL_CONTEXT_LENGTH}",
         "template": "{{ .Prompt }}",
         "details": {
@@ -205,14 +266,14 @@ def build_ollama_show_response(model_name: str) -> dict:
             "parameter_size": MODEL_PARAMETER_SIZE,
             "quantization_level": "proxy",
         },
-        "model_info": build_model_info(),
+        "model_info": build_model_info(model["basename"]),
         "capabilities": MODEL_CAPABILITIES,
     }
 
 
-def build_openai_model_listing() -> dict:
+def build_openai_model_listing(model_name: str) -> dict:
     return {
-        "id": MODEL_NAME,
+        "id": model_name,
         "object": "model",
         "created": 0,
         "owned_by": "ollama-proxy",
@@ -267,6 +328,7 @@ def validation_error_response(message: str) -> JSONResponse:
 
 
 async def create_message_response_async(
+    model_name: str,
     system: str,
     messages: list[dict],
     *,
@@ -278,6 +340,7 @@ async def create_message_response_async(
 ):
     return await run_in_threadpool(
         create_message_response,
+        model_name,
         system,
         messages,
         max_tokens=max_tokens,
@@ -305,12 +368,12 @@ async def version():
 
 @app.get("/api/models")
 async def list_models():
-    return {"models": [build_ollama_listing(MODEL_NAME)]}
+    return {"models": [build_ollama_listing(model["name"]) for model in PROXY_MODELS]}
 
 
 @app.get("/api/tags")
 async def list_tags():
-    return {"models": [build_ollama_listing(MODEL_NAME)]}
+    return {"models": [build_ollama_listing(model["name"]) for model in PROXY_MODELS]}
 
 
 @app.post("/api/embeddings")
@@ -334,7 +397,10 @@ async def ps():
 
 @app.get("/v1/models")
 async def list_openai_models():
-    return {"object": "list", "data": [build_openai_model_listing()]}
+    return {
+        "object": "list",
+        "data": [build_openai_model_listing(model["name"]) for model in PROXY_MODELS],
+    }
 
 
 @app.post("/api/chat")
@@ -343,11 +409,12 @@ async def chat(req: OllamaChatRequest):
     messages = convert_ollama_messages_to_anthropic(
         get_non_system_messages(req.messages)
     )
-    thinking = resolve_thinking_config(req.thinking)
+    thinking = resolve_thinking_config(req.model, req.thinking)
 
     try:
         if req.stream:
             response = await create_message_response_async(
+                req.model,
                 system,
                 messages,
                 stream=True,
@@ -451,7 +518,12 @@ async def non_streaming_chat(
     model: str,
     thinking: dict | None,
 ):
-    response = await create_message_response_async(system, messages, thinking=thinking)
+    response = await create_message_response_async(
+        model,
+        system,
+        messages,
+        thinking=thinking,
+    )
     thinking_blocks = extract_response_thinking_blocks(response)
     text = format_assistant_content(response_text(response), thinking_blocks)
 
@@ -466,12 +538,13 @@ async def non_streaming_chat(
 @app.post("/api/generate")
 async def generate(req: OllamaGenerateRequest):
     messages = [OllamaMessage(role="user", content=req.prompt)]
-    thinking = resolve_thinking_config(req.thinking)
+    thinking = resolve_thinking_config(req.model, req.thinking)
 
     try:
         if req.stream:
             anthropic_messages = convert_ollama_messages_to_anthropic(messages)
             response = await create_message_response_async(
+                req.model,
                 "",
                 anthropic_messages,
                 stream=True,
@@ -576,7 +649,12 @@ async def non_streaming_generate(
     thinking: dict | None,
 ):
     anthropic_messages = convert_ollama_messages_to_anthropic(messages)
-    response = await create_message_response_async("", anthropic_messages, thinking=thinking)
+    response = await create_message_response_async(
+        model,
+        "",
+        anthropic_messages,
+        thinking=thinking,
+    )
     thinking_blocks = extract_response_thinking_blocks(response)
     text = format_assistant_content(response_text(response), thinking_blocks)
 
@@ -596,11 +674,12 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest):
     )
     tools = convert_openai_tools_to_anthropic(req.tools, req.tool_choice)
     tool_choice = convert_openai_tool_choice(req.tool_choice)
-    thinking = resolve_thinking_config(req.thinking)
+    thinking = resolve_thinking_config(req.model, req.thinking)
 
     try:
         if req.stream:
             response = await create_message_response_async(
+                req.model,
                 system,
                 messages,
                 max_tokens=req.max_tokens or 4096,
@@ -729,6 +808,7 @@ async def non_streaming_openai_chat_completions(
     thinking: dict | None,
 ):
     response = await create_message_response_async(
+        model,
         system,
         messages,
         max_tokens=max_tokens or 4096,

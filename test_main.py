@@ -150,6 +150,35 @@ class ProxyCompatibilityTests(unittest.TestCase):
             204800,
         )
 
+    def test_show_uses_model_specific_basename_for_high_variant(self):
+        response = self.client.post("/api/show", json={"model": "MiniMax-M2.7 High"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["name"], "MiniMax-M2.7 High")
+        self.assertEqual(payload["model_info"]["general.basename"], "MiniMax-M2.7 High")
+
+    def test_model_listing_endpoints_expose_standard_and_high_variants(self):
+        models_response = self.client.get("/api/models")
+        tags_response = self.client.get("/api/tags")
+        openai_response = self.client.get("/v1/models")
+
+        self.assertEqual(models_response.status_code, 200)
+        self.assertEqual(tags_response.status_code, 200)
+        self.assertEqual(openai_response.status_code, 200)
+        self.assertEqual(
+            [item["name"] for item in models_response.json()["models"]],
+            ["MiniMax-M2.7", "MiniMax-M2.7 High"],
+        )
+        self.assertEqual(
+            [item["name"] for item in tags_response.json()["models"]],
+            ["MiniMax-M2.7", "MiniMax-M2.7 High"],
+        )
+        self.assertEqual(
+            [item["id"] for item in openai_response.json()["data"]],
+            ["MiniMax-M2.7", "MiniMax-M2.7 High"],
+        )
+
     def test_chat_completions_returns_openai_response_shape(self):
         response = self.client.post(
             "/v1/chat/completions",
@@ -272,6 +301,94 @@ class ProxyCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             main.client.messages.calls[0]["thinking"],
             {"type": "enabled", "budget_tokens": 1024},
+        )
+
+    def test_chat_uses_model_specific_default_thinking_budget(self):
+        low_response = self.client.post(
+            "/api/chat",
+            json={
+                "model": "MiniMax-M2.7",
+                "stream": False,
+                "messages": [{"role": "user", "content": "Say hello."}],
+            },
+        )
+        high_response = self.client.post(
+            "/api/chat",
+            json={
+                "model": "MiniMax-M2.7 High",
+                "stream": False,
+                "messages": [{"role": "user", "content": "Say hello."}],
+            },
+        )
+
+        self.assertEqual(low_response.status_code, 200)
+        self.assertEqual(high_response.status_code, 200)
+        self.assertEqual(
+            main.client.messages.calls[0]["thinking"]["budget_tokens"],
+            8192,
+        )
+        self.assertEqual(
+            main.client.messages.calls[1]["thinking"]["budget_tokens"],
+            24576,
+        )
+        self.assertEqual(
+            main.client.messages.calls[0]["thinking"]["type"],
+            "enabled",
+        )
+        self.assertEqual(
+            main.client.messages.calls[1]["thinking"]["type"],
+            "enabled",
+        )
+
+    def test_chat_uses_env_default_thinking_for_unknown_model_name(self):
+        original_fallback = main.ENV_DEFAULT_THINKING_CONFIG
+        main.ENV_DEFAULT_THINKING_CONFIG = {
+            "type": "enabled",
+            "budget_tokens": 16384,
+            "display": "summarized",
+        }
+
+        try:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "model": "Custom MiniMax Alias",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "Say hello."}],
+                },
+            )
+        finally:
+            main.ENV_DEFAULT_THINKING_CONFIG = original_fallback
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            main.client.messages.calls[0]["thinking"],
+            {
+                "type": "enabled",
+                "budget_tokens": 16384,
+                "display": "summarized",
+            },
+        )
+
+    def test_openai_chat_completions_uses_high_variant_default_thinking_budget(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "MiniMax-M2.7 High",
+                "stream": False,
+                "messages": [{"role": "user", "content": "Say hello."}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["model"], "MiniMax-M2.7 High")
+        self.assertEqual(
+            main.client.messages.calls[0]["thinking"],
+            {
+                "type": "enabled",
+                "budget_tokens": 24576,
+                "display": "summarized",
+            },
         )
 
     def test_chat_completions_translates_tool_history_to_anthropic(self):
